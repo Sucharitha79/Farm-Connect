@@ -1,0 +1,37 @@
+
+.otp-send {
+  margin-top: 10px;
+  padding: 9px 18px;
+  background: #e8f5ec;
+  color: #168344;
+  border: 1px solid #168344;
+  border-radius: 7px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.otp-send:hover {
+  background: #d3ebda;
+}
+
+.otp-verify {
+  margin-top: 10px;
+  padding: 9px 18px;
+  background: #168344;
+  color: white;
+  border: none;
+  border-radius: 7px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.otp-verify:hover {
+  background: #0d6031;
+}
+
+.verified-message {
+  color: #168344;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 15px;
+}
