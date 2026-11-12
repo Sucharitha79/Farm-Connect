@@ -1,3 +1,4 @@
+// Test fixtures only; production API reads and writes through the MongoDB repository.
 export const users = [];
 export const pendingRegistrations = [];
 export const authChallenges = [];

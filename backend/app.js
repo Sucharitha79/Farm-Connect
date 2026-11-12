@@ -11,6 +11,7 @@ import { errorHandler, notFoundHandler } from './middleware/errorHandler.js';
 import bookingRoutes from './routes/bookingRoutes.js';
 import equipmentRoutes from './routes/equipmentRoutes.js';
 import workerRoutes from './routes/workerRoutes.js';
+import wishlistRoutes from './routes/wishlistRoutes.js';
 
 const app = express();
 const allowedOrigins = config.corsOrigin === '*'
@@ -29,6 +30,7 @@ app.use('/api/bids', bidRoutes);
 app.use('/api/orders', orderRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/wishlist', wishlistRoutes);
 app.use(notFoundHandler);
 app.use(errorHandler);
 

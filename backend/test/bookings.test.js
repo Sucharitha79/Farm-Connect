@@ -4,7 +4,10 @@ import { after, before, test } from 'node:test';
 import jwt from 'jsonwebtoken';
 
 process.env.JWT_SECRET = 'test-secret-that-is-long-enough-for-booking-tests';
+process.env.NODE_ENV = 'test';
 
+const { enableInMemoryRepositoryForTests } = await import('../data/repository.js');
+enableInMemoryRepositoryForTests();
 const [{ default: app }, { bookings, users }] = await Promise.all([
   import('../app.js'),
   import('../data/store.js')
@@ -91,7 +94,6 @@ test('farmers book workers and equipment through provider status lifecycles', as
       equipmentName: 'Test Harvester',
       category: 'Harvester',
       description: 'Booking test listing',
-      imageUrl: 'https://example.test/harvester.jpg',
       rentalRateType: 'daily',
       rentalPrice: 1200,
       location: 'Nashik',
@@ -132,6 +134,8 @@ test('farmers book workers and equipment through provider status lifecycles', as
     body: {
       serviceType: 'WORKER',
       serviceId: workerProfile.data.data.worker.id,
+      workType: 'Harvesting',
+      description: 'Harvest the north field and sort the produce.',
       bookingDate: dateOne,
       duration: 2,
       location: 'Nashik'
@@ -141,6 +145,8 @@ test('farmers book workers and equipment through provider status lifecycles', as
   const workerBooking = workerBookingResult.data.data.booking;
   assert.equal(workerBooking.totalPrice, 1000);
   assert.equal(workerBooking.status, 'Pending');
+  assert.equal(workerBooking.workType, 'Harvesting');
+  assert.equal(workerBooking.description, 'Harvest the north field and sort the produce.');
   assert.equal(workerBooking.bookingEndDate, dateTwo);
 
   const duplicate = await callApi('/api/bookings', {
@@ -155,6 +161,21 @@ test('farmers book workers and equipment through provider status lifecycles', as
     }
   });
   assert.equal(duplicate.status, 409);
+
+  const overlappingPending = await callApi('/api/bookings', {
+    method: 'POST',
+    token: secondFarmerToken,
+    body: {
+      serviceType: 'WORKER',
+      serviceId: workerProfile.data.data.worker.id,
+      workType: 'Planting',
+      description: 'Plant the west field.',
+      bookingDate: dateTwo,
+      duration: 1,
+      location: 'Nashik'
+    }
+  });
+  assert.equal(overlappingPending.status, 409);
 
   const strangerRead = await callApi(`/api/bookings/${workerBooking.id}`, {
     token: secondFarmerToken

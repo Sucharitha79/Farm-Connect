@@ -1,10 +1,11 @@
-import { bids, produceListings } from '../data/store.js';
+import { filterRecords, findRecord } from '../data/repository.js';
 
-export const getPriceAnalytics = (req, res) => {
-  const accepted = bids.filter((bid) => bid.status === 'accepted').map((bid) => {
-    const produce = produceListings.find((item) => item.id === bid.produceId);
+export const getPriceAnalytics = async (req, res) => {
+  const acceptedBids = await filterRecords('bids', (bid) => bid.status === 'accepted');
+  const accepted = (await Promise.all(acceptedBids.map(async (bid) => {
+    const produce = await findRecord('produceListings', (item) => item.id === bid.produceId);
     return produce ? { bid, produce } : null;
-  }).filter(Boolean).filter(({ produce }) => {
+  }))).filter(Boolean).filter(({ produce }) => {
     const name = String(req.query.produceName || '').toLowerCase();
     const category = String(req.query.category || '').toLowerCase();
     const location = String(req.query.location || '').toLowerCase();

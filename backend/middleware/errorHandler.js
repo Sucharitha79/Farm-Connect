@@ -6,10 +6,15 @@ export const notFoundHandler = (req, res, next) => {
 
 export const errorHandler = (error, req, res, next) => {
   if (res.headersSent) return next(error);
-  const statusCode = error.statusCode || 500;
+  const isDuplicateKeyError = error.code === 11000;
+  const statusCode = error.statusCode || (isDuplicateKeyError ? 409 : 500);
   if (statusCode >= 500) console.error(error);
   return res.status(statusCode).json({
     success: false,
-    message: statusCode >= 500 && !error.expose ? 'Internal server error.' : error.message
+    message: isDuplicateKeyError
+      ? 'A record with the same unique value already exists.'
+      : statusCode >= 500 && !error.expose
+        ? 'Internal server error.'
+        : error.message
   });
 };

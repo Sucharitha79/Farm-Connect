@@ -1,4 +1,10 @@
-import { bookings, users, workers } from '../data/store.js';
+import {
+  filterRecords,
+  findRecord,
+  insertRecord,
+  removeRecord,
+  updateRecord
+} from '../data/repository.js';
 import { AppError, badRequest, forbidden, notFound } from '../utils/errors.js';
 import {
   requireAvailableDates,
@@ -6,6 +12,7 @@ import {
   requireString
 } from '../utils/validation.js';
 import { getDatesForBooking } from '../utils/bookingDates.js';
+import { cleanupListingImage, rejectImageUrl, resolveListingImage } from '../utils/listingImage.js';
 
 const profileFields = [
   'fullName',
@@ -15,7 +22,8 @@ const profileFields = [
   'wageType',
   'wageAmount',
   'experienceYears',
-  'availableDates'
+  'availableDates',
+  'isAvailable'
 ];
 
 const validateMobileNumber = (value) => {
@@ -28,6 +36,13 @@ const validateMobileNumber = (value) => {
 };
 
 const validateSkills = (value) => {
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      throw badRequest('skills must be an array.');
+    }
+  }
   if (!Array.isArray(value) || value.length < 1 || value.length > 30) {
     throw badRequest('skills must be an array containing 1 to 30 skills.');
   }
@@ -35,10 +50,23 @@ const validateSkills = (value) => {
   return [...new Map(skills.map((skill) => [skill.toLowerCase(), skill])).values()];
 };
 
-const validateProfile = (body, existing = {}) => {
+const validateAvailabilityDates = (value) => {
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      throw badRequest('availableDates must be a JSON array.');
+    }
+  }
+  return requireAvailableDates(value);
+};
+
+const validateProfile = (body, existing = {}, hasImageUpdate = false) => {
   const values = {};
   const hasInput = profileFields.some((field) => Object.hasOwn(body, field));
-  if (!hasInput && existing.id) throw badRequest('Provide at least one profile field to update.');
+  if (!hasInput && !hasImageUpdate && existing.id) {
+    throw badRequest('Provide at least one profile field to update.');
+  }
 
   if (Object.hasOwn(body, 'fullName')) {
     values.fullName = requireString(body.fullName, 'fullName', { max: 100 });
@@ -83,15 +111,23 @@ const validateProfile = (body, existing = {}) => {
     throw badRequest('experienceYears is required.');
   }
   if (Object.hasOwn(body, 'availableDates')) {
-    values.availableDates = requireAvailableDates(body.availableDates);
+    values.availableDates = validateAvailabilityDates(body.availableDates);
   } else if (!existing.availableDates?.length) {
     throw badRequest('availableDates is required.');
+  }
+  if (Object.hasOwn(body, 'isAvailable')) {
+    if (![true, false, 'true', 'false'].includes(body.isAvailable)) {
+      throw badRequest('isAvailable must be true or false.');
+    }
+    values.isAvailable = body.isAvailable === true || body.isAvailable === 'true';
+  } else if (existing.isAvailable === undefined) {
+    values.isAvailable = true;
   }
   return { ...existing, ...values };
 };
 
 const findWorker = (id) =>
-  workers.find((worker) => worker.id === id || worker.userId === id);
+  findRecord('workers', (worker) => worker.id === id || worker.userId === id);
 
 const publicWorker = (worker) => ({
   id: worker.id,
@@ -100,28 +136,40 @@ const publicWorker = (worker) => ({
   mobileNumber: worker.mobileNumber,
   location: worker.location,
   skills: worker.skills,
+  profileImageUrl: worker.imageUrl || '',
   wageType: worker.wageType,
   wageAmount: worker.wageAmount,
   experienceYears: worker.experienceYears,
   availableDates: worker.availableDates,
+  isAvailable: worker.isAvailable !== false,
   createdAt: worker.createdAt,
   updatedAt: worker.updatedAt
 });
 
-export const createWorkerProfile = (req, res) => {
-  if (workers.some((worker) => worker.userId === req.user.id)) {
+export const createWorkerProfile = async (req, res) => {
+  if (await findRecord('workers', (worker) => worker.userId === req.user.id)) {
     throw new AppError(409, 'A worker profile already exists for this account.');
   }
   const body = req.body || {};
+  rejectImageUrl(body);
   const values = validateProfile(body);
+  const image = await resolveListingImage(req, null, 'farmlink/workers');
   const worker = {
     id: req.user.id,
     userId: req.user.id,
     ...values,
+    imageUrl: image.imageUrl,
+    imagePublicId: image.imagePublicId,
     createdAt: new Date().toISOString()
   };
-  workers.push(worker);
-  Object.assign(req.user, {
+  let created;
+  try {
+    created = await insertRecord('workers', worker);
+  } catch (error) {
+    await cleanupListingImage(image.imagePublicId);
+    throw error;
+  }
+  await updateRecord('users', req.user.id, {
     name: worker.fullName,
     mobileNumber: worker.mobileNumber,
     location: worker.location
@@ -129,18 +177,39 @@ export const createWorkerProfile = (req, res) => {
   return res.status(201).json({
     success: true,
     message: 'Worker profile created successfully.',
-    data: { worker: publicWorker(worker) }
+    data: { worker: publicWorker(created) }
   });
 };
 
-export const listWorkers = (req, res) => {
+export const listWorkers = async (req, res) => {
   const location = String(req.query.location || '').toLowerCase();
   const skill = String(req.query.skill || '').toLowerCase();
   const wageType = String(req.query.wageType || '').toLowerCase();
-  const matches = workers.filter((worker) =>
+  if (wageType && !['daily', 'hourly'].includes(wageType)) {
+    throw badRequest('wageType must be daily or hourly.');
+  }
+  const minWage = req.query.minWage === undefined || req.query.minWage === ''
+    ? null
+    : Number(req.query.minWage);
+  const maxWage = req.query.maxWage === undefined || req.query.maxWage === ''
+    ? null
+    : Number(req.query.maxWage);
+  if (
+    (minWage !== null && (!Number.isFinite(minWage) || minWage < 0)) ||
+    (maxWage !== null && (!Number.isFinite(maxWage) || maxWage < 0)) ||
+    (minWage !== null && maxWage !== null && minWage > maxWage)
+  ) {
+    throw badRequest('Wage filters must be non-negative numbers, with minWage no greater than maxWage.');
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const matches = await filterRecords('workers', (worker) =>
+    worker.isAvailable !== false &&
+    (worker.availableDates || []).some((date) => date >= today) &&
     worker.location.toLowerCase().includes(location) &&
     worker.skills.some((entry) => entry.toLowerCase().includes(skill)) &&
-    (!wageType || worker.wageType === wageType)
+    (!wageType || worker.wageType === wageType) &&
+    (minWage === null || worker.wageAmount >= minWage) &&
+    (maxWage === null || worker.wageAmount <= maxWage)
   );
   return res.json({
     success: true,
@@ -149,8 +218,8 @@ export const listWorkers = (req, res) => {
   });
 };
 
-export const getWorker = (req, res) => {
-  const worker = findWorker(req.params.id);
+export const getWorker = async (req, res) => {
+  const worker = await findWorker(req.params.id);
   if (!worker) throw notFound('Worker profile not found.');
   return res.json({
     success: true,
@@ -159,8 +228,8 @@ export const getWorker = (req, res) => {
   });
 };
 
-export const getMyProfile = (req, res) => {
-  const worker = workers.find((entry) => entry.userId === req.user.id);
+export const getMyProfile = async (req, res) => {
+  const worker = await findRecord('workers', (entry) => entry.userId === req.user.id);
   if (!worker) throw notFound('Create a worker profile before viewing it.');
   return res.json({
     success: true,
@@ -169,25 +238,45 @@ export const getMyProfile = (req, res) => {
   });
 };
 
-export const updateWorkerProfile = (req, res) => {
-  const worker = findWorker(req.params.id);
+export const updateWorkerProfile = async (req, res) => {
+  const worker = await findWorker(req.params.id);
   if (!worker) throw notFound('Worker profile not found.');
   if (worker.userId !== req.user.id) throw forbidden();
-  const values = validateProfile(req.body || {}, worker);
-  const hasUnavailableActiveJob = bookings.some((booking) => {
+  rejectImageUrl(req.body || {});
+  const hasImageUpdate = Boolean(req.file) ||
+    req.body?.removeImage === true ||
+    req.body?.removeImage === 'true';
+  const values = validateProfile(req.body || {}, worker, hasImageUpdate);
+  const activeWorkerBookings = await filterRecords('bookings', (booking) => {
     if (
       booking.serviceType !== 'WORKER' ||
       booking.providerId !== worker.userId ||
       !['Pending', 'Accepted'].includes(booking.status)
     ) return false;
-    return getDatesForBooking(booking, worker.wageType)
-      .some((date) => !values.availableDates.includes(date));
+    return true;
   });
+  const hasUnavailableActiveJob = activeWorkerBookings.some((booking) =>
+    getDatesForBooking(booking, worker.wageType)
+      .some((date) => !values.availableDates.includes(date))
+  );
   if (hasUnavailableActiveJob) {
     throw new AppError(409, 'Availability cannot exclude a date with a pending or accepted job.');
   }
-  Object.assign(worker, values, { updatedAt: new Date().toISOString() });
-  Object.assign(req.user, {
+  const image = await resolveListingImage(req, worker, 'farmlink/workers');
+  let updated;
+  try {
+    updated = await updateRecord('workers', worker.id, {
+      ...values,
+      imageUrl: image.imageUrl,
+      imagePublicId: image.imagePublicId,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    if (req.file) await cleanupListingImage(image.imagePublicId);
+    throw error;
+  }
+  await cleanupListingImage(image.previousImagePublicId);
+  await updateRecord('users', req.user.id, {
     name: worker.fullName,
     mobileNumber: worker.mobileNumber,
     location: worker.location
@@ -195,15 +284,15 @@ export const updateWorkerProfile = (req, res) => {
   return res.json({
     success: true,
     message: 'Worker profile updated successfully.',
-    data: { worker: publicWorker(worker) }
+    data: { worker: publicWorker(updated) }
   });
 };
 
-export const deleteWorkerProfile = (req, res) => {
-  const worker = findWorker(req.params.id);
+export const deleteWorkerProfile = async (req, res) => {
+  const worker = await findWorker(req.params.id);
   if (!worker) throw notFound('Worker profile not found.');
   if (worker.userId !== req.user.id) throw forbidden();
-  const hasActiveJobs = bookings.some((booking) =>
+  const hasActiveJobs = await findRecord('bookings', (booking) =>
     booking.serviceType === 'WORKER' &&
     booking.providerId === worker.userId &&
     ['Pending', 'Accepted'].includes(booking.status)
@@ -211,15 +300,17 @@ export const deleteWorkerProfile = (req, res) => {
   if (hasActiveJobs) {
     throw new AppError(409, 'Resolve pending or accepted jobs before deleting this profile.');
   }
-  workers.splice(workers.indexOf(worker), 1);
+  await removeRecord('workers', worker.id);
+  await cleanupListingImage(worker.imagePublicId);
   return res.status(204).send();
 };
 
-export const getWorkerJobs = (req, res) => {
-  const worker = workers.find((entry) => entry.userId === req.user.id);
+export const getWorkerJobs = async (req, res) => {
+  const worker = await findRecord('workers', (entry) => entry.userId === req.user.id);
   if (!worker) throw notFound('Create a worker profile before viewing job requests.');
-  const workerBookings = bookings
-    .filter((booking) => booking.serviceType === 'WORKER' && booking.providerId === worker.userId)
+  const workerBookings = (await filterRecords('bookings', (booking) =>
+    booking.serviceType === 'WORKER' && booking.providerId === worker.userId
+  ))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   return res.json({
     success: true,
@@ -233,15 +324,14 @@ export const getWorkerJobs = (req, res) => {
   });
 };
 
-export const listWorkerJobRequests = (req, res) => {
-  const worker = workers.find((entry) => entry.userId === req.user.id);
+export const listWorkerJobRequests = async (req, res) => {
+  const worker = await findRecord('workers', (entry) => entry.userId === req.user.id);
   if (!worker) throw notFound('Create a worker profile before viewing job requests.');
-  const jobRequests = bookings
-    .filter((booking) =>
+  const jobRequests = (await filterRecords('bookings', (booking) =>
       booking.serviceType === 'WORKER' &&
       booking.providerId === worker.userId &&
       booking.status === 'Pending'
-    )
+    ))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   return res.json({
     success: true,

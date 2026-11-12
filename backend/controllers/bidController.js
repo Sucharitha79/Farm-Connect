@@ -1,10 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { bids, orders, produceListings } from '../data/store.js';
+import {
+  filterRecords,
+  findRecord,
+  insertRecord,
+  updateRecord,
+  updateRecords
+} from '../data/repository.js';
 import { AppError, badRequest, forbidden, notFound } from '../utils/errors.js';
 import { requirePositiveNumber, optionalString } from '../utils/validation.js';
 
-export const createBid = (req, res) => {
-  const listing = produceListings.find((item) => item.id === req.body.produceId);
+export const createBid = async (req, res) => {
+  const listing = await findRecord('produceListings', (item) => item.id === req.body.produceId);
   if (!listing) throw notFound('Produce listing not found.');
   if (listing.status !== 'available') throw new AppError(409, 'This listing is not accepting bids.');
   const bidAmount = requirePositiveNumber(req.body.bidAmount, 'bidAmount');
@@ -20,19 +26,17 @@ export const createBid = (req, res) => {
     status: 'pending',
     createdAt: new Date().toISOString()
   };
-  bids.push(bid);
-  return res.status(201).json({ bid });
+  return res.status(201).json({ bid: await insertRecord('bids', bid) });
 };
 
-export const listMyBids = (req, res) =>
-  res.json({ bids: bids.filter((bid) => bid.buyerId === req.user.id) });
+export const listMyBids = async (req, res) =>
+  res.json({ bids: await filterRecords('bids', (bid) => bid.buyerId === req.user.id) });
 
-export const listBidsForProduce = (req, res) => {
-  const listing = produceListings.find((item) => item.id === req.params.produceId);
+export const listBidsForProduce = async (req, res) => {
+  const listing = await findRecord('produceListings', (item) => item.id === req.params.produceId);
   if (!listing) throw notFound('Produce listing not found.');
   if (req.user.role !== 'admin' && listing.farmerId !== req.user.id) throw forbidden();
-  const listingBids = bids
-    .filter((bid) => bid.produceId === listing.id)
+  const listingBids = (await filterRecords('bids', (bid) => bid.produceId === listing.id))
     .sort((a, b) => b.bidAmount - a.bidAmount);
   return res.json({
     bids: listingBids,
@@ -40,12 +44,12 @@ export const listBidsForProduce = (req, res) => {
   });
 };
 
-export const updateBid = (req, res) => {
-  const bid = bids.find((entry) => entry.id === req.params.id);
+export const updateBid = async (req, res) => {
+  const bid = await findRecord('bids', (entry) => entry.id === req.params.id);
   if (!bid) throw notFound('Bid not found.');
   if (bid.buyerId !== req.user.id) throw forbidden();
   if (bid.status !== 'pending') throw new AppError(409, 'Only pending bids can be updated or withdrawn.');
-  const listing = produceListings.find((item) => item.id === bid.produceId);
+  const listing = await findRecord('produceListings', (item) => item.id === bid.produceId);
   if (!listing || listing.status !== 'available') {
     throw new AppError(409, 'The listing is no longer available.');
   }
@@ -69,13 +73,13 @@ export const updateBid = (req, res) => {
     }
   }
   bid.updatedAt = new Date().toISOString();
-  return res.json({ bid });
+  return res.json({ bid: await updateRecord('bids', bid.id, bid) });
 };
 
-export const decideBid = (req, res) => {
-  const bid = bids.find((entry) => entry.id === req.params.id);
+export const decideBid = async (req, res) => {
+  const bid = await findRecord('bids', (entry) => entry.id === req.params.id);
   if (!bid) throw notFound('Bid not found.');
-  const listing = produceListings.find((item) => item.id === bid.produceId);
+  const listing = await findRecord('produceListings', (item) => item.id === bid.produceId);
   if (!listing) throw notFound('Produce listing not found.');
   if (listing.farmerId !== req.user.id) throw forbidden();
   if (bid.status !== 'pending') throw new AppError(409, 'Only pending bids can be accepted or rejected.');
@@ -85,16 +89,11 @@ export const decideBid = (req, res) => {
 
   if (req.body.status === 'accepted') {
     if (listing.status !== 'available') throw new AppError(409, 'This listing is no longer available.');
-    if (orders.some((order) => order.produceId === listing.id)) {
+    if (await findRecord('orders', (order) => order.produceId === listing.id)) {
       throw new AppError(409, 'An order already exists for this listing.');
     }
     bid.status = 'accepted';
     listing.status = 'closed';
-    for (const otherBid of bids) {
-      if (otherBid.produceId === listing.id && otherBid.status === 'pending') {
-        otherBid.status = 'rejected';
-      }
-    }
     const order = {
       id: randomUUID(),
       orderNumber: `FL-${randomUUID().replaceAll('-', '').slice(0, 12).toUpperCase()}`,
@@ -109,10 +108,17 @@ export const decideBid = (req, res) => {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
-    orders.push(order);
-    return res.json({ bid, order });
+    await updateRecord('bids', bid.id, { status: bid.status });
+    await updateRecord('produceListings', listing.id, { status: listing.status });
+    await updateRecords('bids', (otherBid) =>
+      otherBid.produceId === listing.id &&
+      otherBid.status === 'pending' &&
+      otherBid.id !== bid.id,
+    { status: 'rejected' });
+    const createdOrder = await insertRecord('orders', order);
+    return res.json({ bid, order: createdOrder });
   }
 
   bid.status = 'rejected';
-  return res.json({ bid });
+  return res.json({ bid: await updateRecord('bids', bid.id, { status: bid.status }) });
 };

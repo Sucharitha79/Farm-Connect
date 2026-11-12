@@ -1,6 +1,6 @@
 import jwt from 'jsonwebtoken';
 import { config } from '../config/env.js';
-import { users } from '../data/store.js';
+import { findRecord } from '../data/repository.js';
 import { AppError, forbidden } from '../utils/errors.js';
 
 export const authenticate = (req, res, next) => {
@@ -11,12 +11,15 @@ export const authenticate = (req, res, next) => {
 
   try {
     const payload = jwt.verify(token, config.jwtSecret);
-    const user = users.find((entry) => entry.id === payload.sub);
-    if (!user) return next(new AppError(401, 'The authenticated user no longer exists.'));
-    if (user.isVerified !== true) return next(new AppError(401, 'Email verification is required.'));
-    if (user.isBlocked) return next(forbidden('This account has been blocked.'));
-    req.user = user;
-    return next();
+    findRecord('users', (entry) => entry.id === payload.sub)
+      .then((user) => {
+        if (!user) return next(new AppError(401, 'The authenticated user no longer exists.'));
+        if (user.isVerified !== true) return next(new AppError(401, 'Email verification is required.'));
+        if (user.isBlocked) return next(forbidden('This account has been blocked.'));
+        req.user = user;
+        return next();
+      })
+      .catch(next);
   } catch (error) {
     if (error instanceof AppError) return next(error);
     return next(new AppError(401, 'The token is invalid or expired.'));

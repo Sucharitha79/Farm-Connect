@@ -49,10 +49,13 @@ const smtpServer = net.createServer((socket) => {
 
 await new Promise((resolve) => smtpServer.listen(0, '127.0.0.1', resolve));
 process.env.JWT_SECRET = 'test-secret-that-is-long-enough-for-api-tests';
+process.env.NODE_ENV = 'test';
 process.env.SMTP_HOST = '127.0.0.1';
 process.env.SMTP_PORT = String(smtpServer.address().port);
 process.env.SMTP_FROM = 'FarmLink Test <noreply@example.test>';
 
+const { enableInMemoryRepositoryForTests } = await import('../data/repository.js');
+enableInMemoryRepositoryForTests();
 const [{ default: app }, { users }] = await Promise.all([
   import('../app.js'),
   import('../data/store.js')
@@ -96,11 +99,14 @@ const registerAndVerify = async (name, email, role) => {
   assert.equal(registration.data.success, true);
   assert.deepEqual(Object.keys(registration.data.data).sort(), ['email', 'verificationId']);
 
+  const emailsBeforePendingLogin = deliveredEmails.length;
   const beforeVerificationLogin = await callApi('/api/auth/login', {
     method: 'POST',
     body: { email, password: 'FarmLinkPass123' }
   });
-  assert.equal(beforeVerificationLogin.status, 401);
+  assert.equal(beforeVerificationLogin.status, 403);
+  assert.match(beforeVerificationLogin.data.message, /verify your email/i);
+  assert.equal(deliveredEmails.length, emailsBeforePendingLogin);
 
   const verification = await callApi('/api/auth/register/verify', {
     method: 'POST',
@@ -115,21 +121,18 @@ const registerAndVerify = async (name, email, role) => {
   return verification.data.data.user;
 };
 
-const loginAndVerify = async (email) => {
+const loginWithPassword = async (email, password = 'FarmLinkPass123') => {
+  const emailCountBeforeLogin = deliveredEmails.length;
   const login = await callApi('/api/auth/login', {
     method: 'POST',
-    body: { email, password: 'FarmLinkPass123' }
+    body: { email, password }
   });
   assert.equal(login.status, 200);
-  const otp = latestEmailOtp();
-  const verificationId = login.data.data.verificationId;
-  const verified = await callApi('/api/auth/login/verify', {
-    method: 'POST',
-    body: { verificationId, otp }
-  });
-  assert.equal(verified.status, 200);
-  assert.equal(verified.data.success, true);
-  return { ...verified.data.data, verificationId, otp };
+  assert.equal(login.data.success, true);
+  assert.equal(typeof login.data.data.token, 'string');
+  assert.equal(Object.hasOwn(login.data.data, 'verificationId'), false);
+  assert.equal(deliveredEmails.length, emailCountBeforeLogin);
+  return login.data.data;
 };
 
 const withClockAdvanced = async (milliseconds, callback) => {
@@ -166,7 +169,7 @@ after(async () => {
   );
 });
 
-test('email OTP registration, five-role auth, and two-step login', async () => {
+test('email OTP registration and direct password login for all roles', async () => {
   const farmer = await registerAndVerify('Test Farmer', 'farmer@example.test', 'farmer');
   const buyer = await registerAndVerify('Test Buyer', 'buyer@example.test', 'buyer');
   const worker = await registerAndVerify('Test Worker', 'worker@example.test', 'worker');
@@ -179,82 +182,90 @@ test('email OTP registration, five-role auth, and two-step login', async () => {
   assert.equal(worker.role, 'worker');
   assert.equal(equipmentOwner.role, 'equipment_owner');
 
-  const farmerLogin = await loginAndVerify(farmer.email);
-  const buyerLogin = await loginAndVerify(buyer.email);
+  const farmerLogin = await loginWithPassword(farmer.email);
+  const buyerLogin = await loginWithPassword(buyer.email);
   assert.equal(farmerLogin.user.role, 'farmer');
   assert.equal((await callApi('/api/auth/profile', { token: farmerLogin.token })).data.data.user.role, 'farmer');
-  const immediateRepeatLogin = await callApi('/api/auth/login', {
+  const roleSpoofLogin = await callApi('/api/auth/login', {
     method: 'POST',
-    body: { email: farmer.email, password: 'FarmLinkPass123' }
+    body: { email: farmer.email, password: 'FarmLinkPass123', role: 'buyer' }
   });
-  assert.equal(immediateRepeatLogin.status, 429);
+  assert.equal(roleSpoofLogin.status, 200);
+  assert.equal(roleSpoofLogin.data.data.user.role, 'farmer');
+  assert.equal((await callApi('/api/produce/mine', { token: roleSpoofLogin.data.data.token })).status, 200);
 
-  const workerLogin = await callApi('/api/auth/login', {
+  const invalidPassword = await callApi('/api/auth/login', {
     method: 'POST',
-    body: { email: worker.email, password: 'FarmLinkPass123' }
+    body: { email: farmer.email, password: 'WrongPassword123' }
   });
-  const firstWorkerOtp = latestEmailOtp();
-  const tooSoonLoginResend = await callApi('/api/auth/login/resend-otp', {
+  assert.equal(invalidPassword.status, 401);
+  assert.equal(invalidPassword.data.message, 'Email or password is incorrect.');
+
+  const unverifiedUser = {
+    id: randomUUID(),
+    name: 'Unverified Test User',
+    email: 'unverified@example.test',
+    passwordHash: await bcrypt.hash('FarmLinkPass123', 4),
+    role: 'farmer',
+    isVerified: false,
+    isBlocked: false,
+    createdAt: new Date().toISOString()
+  };
+  users.push(unverifiedUser);
+  const unverifiedLogin = await callApi('/api/auth/login', {
     method: 'POST',
-    body: { verificationId: workerLogin.data.data.verificationId }
+    body: { email: unverifiedUser.email, password: 'FarmLinkPass123' }
   });
-  assert.equal(tooSoonLoginResend.status, 429);
-  const workerResent = await withClockAdvanced(61_000, () =>
-    callApi('/api/auth/login/resend-otp', {
-      method: 'POST',
-      body: { verificationId: workerLogin.data.data.verificationId }
-    })
-  );
-  assert.equal(workerResent.status, 200);
-  const oldWorkerOtp = await callApi('/api/auth/login/verify', {
+  assert.equal(unverifiedLogin.status, 403);
+  assert.match(unverifiedLogin.data.message, /verify your email/i);
+
+  const invalidRoleUser = {
+    id: randomUUID(),
+    name: 'Invalid Role Test User',
+    email: 'invalid-role@example.test',
+    passwordHash: await bcrypt.hash('FarmLinkPass123', 4),
+    role: 'unexpected',
+    isVerified: true,
+    isBlocked: false,
+    createdAt: new Date().toISOString()
+  };
+  users.push(invalidRoleUser);
+  const invalidRoleLogin = await callApi('/api/auth/login', {
     method: 'POST',
+    body: { email: invalidRoleUser.email, password: 'FarmLinkPass123' }
+  });
+  assert.equal(invalidRoleLogin.status, 403);
+  assert.match(invalidRoleLogin.data.message, /invalid role/i);
+
+  const updatedProfile = await callApi('/api/auth/profile', {
+    method: 'PUT',
+    token: farmerLogin.token,
     body: {
-      verificationId: workerLogin.data.data.verificationId,
-      otp: firstWorkerOtp
+      farmName: 'Green Acres',
+      address: 'Farm Road',
+      city: 'Nashik',
+      state: 'Maharashtra',
+      pincode: '422001'
     }
   });
-  assert.equal(oldWorkerOtp.status, 400);
-  const workerVerified = await callApi('/api/auth/login/verify', {
-    method: 'POST',
-    body: {
-      verificationId: workerResent.data.data.verificationId,
-      otp: latestEmailOtp()
-    }
+  assert.equal(updatedProfile.status, 200);
+  assert.equal(updatedProfile.data.data.user.farmName, 'Green Acres');
+  assert.equal(updatedProfile.data.data.user.pincode, '422001');
+  const unsupportedProfileField = await callApi('/api/auth/profile', {
+    method: 'PUT',
+    token: farmerLogin.token,
+    body: { role: 'admin' }
   });
-  assert.equal(workerVerified.status, 200);
-  assert.equal(workerVerified.data.data.user.role, 'worker');
-
-  const expiringLogin = await callApi('/api/auth/login', {
-    method: 'POST',
-    body: { email: equipmentOwner.email, password: 'FarmLinkPass123' }
-  });
-  const expiredOtp = latestEmailOtp();
-  const expiredVerification = await withClockAdvanced(5 * 60_000 + 1, () =>
-    callApi('/api/auth/login/verify', {
-      method: 'POST',
-      body: {
-        verificationId: expiringLogin.data.data.verificationId,
-        otp: expiredOtp
-      }
-    })
-  );
-  assert.equal(expiredVerification.status, 400);
-  assert.equal(expiredVerification.data.message, 'Invalid or expired OTP.');
-
-  const adminStepOne = await callApi('/api/auth/login', {
-    method: 'POST',
-    body: { email: 'admin@example.test', password: 'AdminPassword123' }
-  });
-  assert.equal(adminStepOne.status, 200);
-  const adminTokenResult = await callApi('/api/auth/login/verify', {
-    method: 'POST',
-    body: {
-      verificationId: adminStepOne.data.data.verificationId,
-      otp: latestEmailOtp()
-    }
-  });
-  assert.equal(adminTokenResult.status, 200);
-  const adminToken = adminTokenResult.data.data.token;
+  assert.equal(unsupportedProfileField.status, 400);
+  const workerLogin = await loginWithPassword(worker.email);
+  assert.equal(workerLogin.user.role, 'worker');
+  const equipmentOwnerLogin = await loginWithPassword(equipmentOwner.email);
+  assert.equal(equipmentOwnerLogin.user.role, 'equipment_owner');
+  const adminLogin = await loginWithPassword('admin@example.test', 'AdminPassword123');
+  assert.equal(adminLogin.user.role, 'admin');
+  const adminToken = adminLogin.token;
+  assert.ok(Array.isArray((await callApi('/api/admin/equipment', { token: adminToken })).data.equipment));
+  assert.ok(Array.isArray((await callApi('/api/admin/bookings', { token: adminToken })).data.bookings));
 
   const listingResult = await callApi('/api/produce', {
     method: 'POST',

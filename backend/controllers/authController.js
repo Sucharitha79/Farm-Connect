@@ -3,11 +3,13 @@ import jwt from 'jsonwebtoken';
 import { randomUUID } from 'node:crypto';
 import { config } from '../config/env.js';
 import {
-  authChallenges,
-  otpCooldowns,
-  pendingRegistrations,
-  users
-} from '../data/store.js';
+  filterRecords,
+  findRecord,
+  insertRecord,
+  removeRecord,
+  removeRecords,
+  updateRecord
+} from '../data/repository.js';
 import { AppError, badRequest } from '../utils/errors.js';
 import { isValidEmail, requireString } from '../utils/validation.js';
 import { generateOTP, hashOTP, verifyOTP } from '../utils/generateOTP.js';
@@ -17,6 +19,7 @@ const OTP_LIFETIME_MS = 5 * 60 * 1000;
 const OTP_RESEND_WAIT_MS = 60 * 1000;
 const OTP_MAX_ATTEMPTS = 5;
 const registrationRoles = ['farmer', 'buyer', 'worker', 'equipment_owner'];
+const accountRoles = new Set([...registrationRoles, 'admin']);
 
 const publicUser = ({ passwordHash, ...user }) => user;
 
@@ -38,21 +41,23 @@ const validateMobileNumber = (value) => {
 };
 
 const findChallenge = (verificationId, purpose) =>
-  authChallenges.find((challenge) =>
-    challenge.id === verificationId && challenge.purpose === purpose
+  findRecord(
+    'authChallenges',
+    (challenge) => challenge.id === verificationId && challenge.purpose === purpose,
+    { includeSecrets: true }
   );
 
 const secondsUntilResend = (lastSentAt) =>
   Math.max(0, Math.ceil((lastSentAt + OTP_RESEND_WAIT_MS - Date.now()) / 1000));
 
-const issueChallenge = async ({ purpose, email, userId, registration }) => {
-  const cooldown = otpCooldowns.find((entry) =>
+const issueChallenge = async ({ purpose, email, registration }) => {
+  let cooldown = await findRecord('otpCooldowns', (entry) =>
     entry.email === email && entry.purpose === purpose
   );
   if (cooldown?.inFlight) {
     throw new AppError(429, 'An OTP request is already being processed.');
   }
-  const existing = authChallenges.find((challenge) =>
+  const existing = await findRecord('authChallenges', (challenge) =>
     challenge.email === email && challenge.purpose === purpose
   );
   const lastSentAt = Math.max(
@@ -65,10 +70,19 @@ const issueChallenge = async ({ purpose, email, userId, registration }) => {
     throw new AppError(429, `Please wait ${retryAfterSeconds} seconds before requesting another OTP.`);
   }
 
-  const cooldownEntry = cooldown || { email, purpose, lastSentAt: 0 };
-  if (!cooldown) otpCooldowns.push(cooldownEntry);
+  const cooldownEntry = cooldown || {
+    id: randomUUID(),
+    email,
+    purpose,
+    lastSentAt: 0,
+    inFlight: false
+  };
+  if (!cooldown) {
+    cooldown = await insertRecord('otpCooldowns', cooldownEntry);
+  }
   const previousLastSentAt = cooldownEntry.lastSentAt;
   cooldownEntry.inFlight = true;
+  await updateRecord('otpCooldowns', cooldownEntry.id, { inFlight: true });
   const now = Date.now();
   let challenge;
 
@@ -79,24 +93,21 @@ const issueChallenge = async ({ purpose, email, userId, registration }) => {
       id: randomUUID(),
       email,
       purpose,
-      userId,
       salt,
       otpHash: hash,
       attempts: 0,
       createdAt: now,
-      expiresAt: now + OTP_LIFETIME_MS,
+      expiresAt: new Date(now + OTP_LIFETIME_MS),
       lastSentAt: now
     };
 
-    for (let index = authChallenges.length - 1; index >= 0; index -= 1) {
-      if (authChallenges[index].email === email && authChallenges[index].purpose === purpose) {
-        authChallenges.splice(index, 1);
-      }
-    }
-    authChallenges.push(challenge);
+    await removeRecords('authChallenges', (entry) =>
+      entry.email === email && entry.purpose === purpose
+    );
+    await insertRecord('authChallenges', challenge);
 
     try {
-      await sendOtpEmail(email, otp, purpose);
+      await sendOtpEmail(email, otp);
     } catch (error) {
       console.error(`FarmLink OTP email delivery failed (${error.code || error.name || 'SMTP error'}).`);
       throw error instanceof AppError
@@ -104,55 +115,60 @@ const issueChallenge = async ({ purpose, email, userId, registration }) => {
         : new AppError(503, 'Unable to send the OTP email. Please try again later.');
     }
 
-    cooldownEntry.lastSentAt = now;
-    cooldownEntry.inFlight = false;
-    if (registration) registration.lastOtpSentAt = now;
+    await updateRecord('otpCooldowns', cooldownEntry.id, { lastSentAt: now, inFlight: false });
+    if (registration) {
+      await updateRecord('pendingRegistrations', registration.id, { lastOtpSentAt: now });
+    }
     return challenge;
   } catch (error) {
     if (challenge) {
-      const challengeIndex = authChallenges.indexOf(challenge);
-      if (challengeIndex >= 0) authChallenges.splice(challengeIndex, 1);
+      await removeRecord('authChallenges', challenge.id);
     }
-    cooldownEntry.inFlight = false;
-    cooldownEntry.lastSentAt = previousLastSentAt;
+    await updateRecord('otpCooldowns', cooldownEntry.id, {
+      inFlight: false,
+      lastSentAt: previousLastSentAt
+    });
     if (!previousLastSentAt) {
-      const cooldownIndex = otpCooldowns.indexOf(cooldownEntry);
-      if (cooldownIndex >= 0) otpCooldowns.splice(cooldownIndex, 1);
+      await removeRecord('otpCooldowns', cooldownEntry.id);
     }
     throw error;
   }
 };
 
 const verifyChallenge = async (verificationId, otp, purpose) => {
-  const challenge = findChallenge(verificationId, purpose);
+  const challenge = await findChallenge(verificationId, purpose);
   if (!challenge || challenge.expiresAt <= Date.now()) {
-    if (challenge) authChallenges.splice(authChallenges.indexOf(challenge), 1);
+    if (challenge) await removeRecord('authChallenges', challenge.id);
     throw new AppError(400, 'Invalid or expired OTP.');
   }
   if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
-    authChallenges.splice(authChallenges.indexOf(challenge), 1);
+    await removeRecord('authChallenges', challenge.id);
     throw new AppError(400, 'Invalid or expired OTP.');
   }
 
   if (typeof otp !== 'string' || !/^\d{6}$/.test(otp)) {
     challenge.attempts += 1;
     if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
-      authChallenges.splice(authChallenges.indexOf(challenge), 1);
+      await removeRecord('authChallenges', challenge.id);
+    } else {
+      await updateRecord('authChallenges', challenge.id, { attempts: challenge.attempts });
     }
     throw badRequest('otp must be a 6-digit code.');
   }
 
   const isValid = await verifyOTP(otp, challenge.salt, challenge.otpHash);
-  const challengeIndex = authChallenges.indexOf(challenge);
-  if (challengeIndex < 0) throw new AppError(400, 'Invalid or expired OTP.');
+  const currentChallenge = await findChallenge(verificationId, purpose);
+  if (!currentChallenge) throw new AppError(400, 'Invalid or expired OTP.');
   if (!isValid) {
-    challenge.attempts += 1;
-    if (challenge.attempts >= OTP_MAX_ATTEMPTS) {
-      authChallenges.splice(challengeIndex, 1);
+    const attempts = currentChallenge.attempts + 1;
+    if (attempts >= OTP_MAX_ATTEMPTS) {
+      await removeRecord('authChallenges', currentChallenge.id);
+    } else {
+      await updateRecord('authChallenges', currentChallenge.id, { attempts });
     }
     throw new AppError(400, 'Invalid or expired OTP.');
   }
-  authChallenges.splice(challengeIndex, 1);
+  await removeRecord('authChallenges', currentChallenge.id);
   return challenge;
 };
 
@@ -174,8 +190,8 @@ export const register = async (req, res) => {
   if (!registrationRoles.includes(role)) {
     throw badRequest(`role must be one of: ${registrationRoles.join(', ')}. Admin accounts cannot be registered publicly.`);
   }
-  if (users.some((user) => user.email === email) ||
-      pendingRegistrations.some((registration) => registration.email === email)) {
+  if (await findRecord('users', (user) => user.email === email) ||
+      await findRecord('pendingRegistrations', (registration) => registration.email === email)) {
     throw new AppError(409, 'An account with this email already exists or is awaiting verification.');
   }
 
@@ -190,7 +206,7 @@ export const register = async (req, res) => {
     createdAt: new Date().toISOString(),
     lastOtpSentAt: null
   };
-  pendingRegistrations.push(registration);
+  await insertRecord('pendingRegistrations', registration);
   try {
     const challenge = await issueChallenge({
       purpose: 'registration',
@@ -203,7 +219,7 @@ export const register = async (req, res) => {
       data: { verificationId: challenge.id, email }
     });
   } catch (error) {
-    pendingRegistrations.splice(pendingRegistrations.indexOf(registration), 1);
+    await removeRecord('pendingRegistrations', registration.id);
     throw error;
   }
 };
@@ -215,12 +231,13 @@ export const verifyRegistration = async (req, res) => {
     body.otp,
     'registration'
   );
-  const registrationIndex = pendingRegistrations.findIndex(
-    (entry) => entry.email === challenge.email
+  const registration = await findRecord(
+    'pendingRegistrations',
+    (entry) => entry.email === challenge.email,
+    { includeSecrets: true }
   );
-  if (registrationIndex < 0) throw new AppError(400, 'Invalid or expired OTP.');
-
-  const [registration] = pendingRegistrations.splice(registrationIndex, 1);
+  if (!registration) throw new AppError(400, 'Invalid or expired OTP.');
+  await removeRecord('pendingRegistrations', registration.id);
   const user = {
     id: registration.id,
     name: registration.name,
@@ -233,7 +250,7 @@ export const verifyRegistration = async (req, res) => {
     isBlocked: false,
     createdAt: registration.createdAt
   };
-  users.push(user);
+  await insertRecord('users', user);
   return res.json({
     success: true,
     message: 'Email verified successfully. You can now log in.',
@@ -245,7 +262,7 @@ export const resendRegistrationOtp = async (req, res) => {
   const body = req.body || {};
   const email = normalizeEmail(body.email);
   if (!isValidEmail(email)) throw badRequest('A valid email address is required.');
-  const registration = pendingRegistrations.find((entry) => entry.email === email);
+  const registration = await findRecord('pendingRegistrations', (entry) => entry.email === email);
   if (!registration) throw new AppError(404, 'No registration is awaiting verification for this email.');
 
   const challenge = await issueChallenge({
@@ -265,54 +282,34 @@ export const login = async (req, res) => {
   const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
   const password = body.password;
   if (!isValidEmail(email)) throw badRequest('A valid email address is required.');
-  const user = users.find((entry) => entry.email === email);
-  if (!user || typeof password !== 'string' ||
-      !(await bcrypt.compare(password, user.passwordHash))) {
+  const user = await findRecord(
+    'users',
+    (entry) => entry.email === email,
+    { includeSecrets: true }
+  );
+  if (!user) {
+    const pendingRegistration = await findRecord(
+      'pendingRegistrations',
+      (entry) => entry.email === email,
+      { includeSecrets: true }
+    );
+    if (pendingRegistration && typeof password === 'string' &&
+        await bcrypt.compare(password, pendingRegistration.passwordHash)) {
+      throw new AppError(403, 'Please verify your email to complete registration before logging in.');
+    }
+    throw new AppError(401, 'Email or password is incorrect.');
+  }
+  if (typeof password !== 'string' || !(await bcrypt.compare(password, user.passwordHash))) {
     throw new AppError(401, 'Email or password is incorrect.');
   }
   if (user.isVerified !== true) {
-    throw new AppError(403, 'Email verification is required before login.');
+    throw new AppError(403, 'Please verify your email to complete registration before logging in.');
   }
   if (user.isBlocked) throw new AppError(403, 'This account has been blocked.');
-
-  const challenge = await issueChallenge({
-    purpose: 'login',
-    email,
-    userId: user.id
-  });
-  return res.json({
-    success: true,
-    message: 'Login OTP sent to your email.',
-    data: { verificationId: challenge.id, email }
-  });
-};
-
-export const resendLoginOtp = async (req, res) => {
-  const body = req.body || {};
-  const previousChallenge = findChallenge(body.verificationId, 'login');
-  if (!previousChallenge) throw new AppError(404, 'Login verification was not found. Please log in again.');
-  const user = users.find((entry) => entry.id === previousChallenge.userId);
-  if (!user || user.isBlocked) throw new AppError(403, 'This account cannot log in.');
-
-  const challenge = await issueChallenge({
-    purpose: 'login',
-    email: user.email,
-    userId: user.id
-  });
-  return res.json({
-    success: true,
-    message: 'A new login OTP was sent to your email.',
-    data: { verificationId: challenge.id, email: user.email }
-  });
-};
-
-export const verifyLogin = async (req, res) => {
-  const body = req.body || {};
-  const challenge = await verifyChallenge(body.verificationId, body.otp, 'login');
-  const user = users.find((entry) => entry.id === challenge.userId);
-  if (!user || user.isVerified !== true || user.isBlocked) {
-    throw new AppError(403, 'This account cannot log in.');
+  if (!accountRoles.has(user.role)) {
+    throw new AppError(403, 'This account has an invalid role. Please contact support.');
   }
+
   return res.json({
     success: true,
     message: 'Login successful.',
@@ -325,3 +322,31 @@ export const getProfile = (req, res) => res.json({
   message: 'Profile retrieved successfully.',
   data: { user: publicUser(req.user) }
 });
+
+export const updateProfile = async (req, res) => {
+  const allowedFields = ['name', 'mobileNumber', 'location', 'farmName', 'address', 'city', 'state', 'pincode'];
+  const body = req.body || {};
+  const fields = Object.keys(body);
+  if (!fields.length || fields.some((field) => !allowedFields.includes(field))) {
+    throw badRequest('Provide at least one supported profile field.');
+  }
+
+  const values = {};
+  for (const field of fields) {
+    const max = field === 'address' ? 500 : 100;
+    const min = ['name', 'mobileNumber'].includes(field) ? 1 : 0;
+    values[field] = requireString(body[field], field, { max, min });
+  }
+  if (Object.hasOwn(values, 'mobileNumber')) {
+    values.mobileNumber = validateMobileNumber(values.mobileNumber);
+  }
+  if (Object.hasOwn(values, 'pincode') && values.pincode && !/^\d{6}$/.test(values.pincode)) {
+    throw badRequest('pincode must contain exactly 6 digits.');
+  }
+  const user = await updateRecord('users', req.user.id, values);
+  return res.json({
+    success: true,
+    message: 'Profile updated successfully.',
+    data: { user: publicUser(user) }
+  });
+};

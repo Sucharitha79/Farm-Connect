@@ -3,9 +3,8 @@ import {
   getProfile,
   login,
   register,
-  resendLoginOtp,
   resendRegistrationOtp,
-  verifyLogin,
+  updateProfile,
   verifyRegistration
 } from '../controllers/authController.js';
 import { authenticate } from '../middleware/auth.js';
@@ -16,8 +15,7 @@ router.post('/register', asyncHandler(register));
 router.post('/register/verify', asyncHandler(verifyRegistration));
 router.post('/register/resend-otp', asyncHandler(resendRegistrationOtp));
 router.post('/login', asyncHandler(login));
-router.post('/login/verify', asyncHandler(verifyLogin));
-router.post('/login/resend-otp', asyncHandler(resendLoginOtp));
 router.get('/profile', authenticate, asyncHandler(getProfile));
+router.put('/profile', authenticate, asyncHandler(updateProfile));
 
 export default router;

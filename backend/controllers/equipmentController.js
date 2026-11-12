@@ -1,5 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { bookings, equipment } from '../data/store.js';
+import {
+  filterRecords,
+  findRecord,
+  insertRecord,
+  listRecords,
+  removeRecord,
+  updateRecord
+} from '../data/repository.js';
 import { AppError, badRequest, forbidden, notFound } from '../utils/errors.js';
 import {
   requireAvailableDates,
@@ -7,33 +14,26 @@ import {
   requireString
 } from '../utils/validation.js';
 import { getDatesForBooking } from '../utils/bookingDates.js';
+import {
+  cleanupListingImage,
+  rejectImageUrl,
+  resolveListingImage
+} from '../utils/listingImage.js';
 
 const equipmentFields = [
   'equipmentName',
   'category',
   'description',
-  'imageUrl',
   'rentalRateType',
   'rentalPrice',
   'location',
-  'availableDates'
+  'availableDates',
+  'removeImage'
 ];
 
-const validateImageUrl = (value) => {
-  if (value === '') return '';
-  const imageUrl = requireString(value, 'imageUrl', { max: 2000 });
-  try {
-    const url = new URL(imageUrl);
-    if (!['http:', 'https:'].includes(url.protocol)) throw new Error('Unsupported protocol');
-  } catch {
-    throw badRequest('imageUrl must be a valid HTTP or HTTPS URL.');
-  }
-  return imageUrl;
-};
-
-const validateEquipment = (body, existing = {}) => {
+const validateEquipment = (body, existing = {}, hasImageUpload = false) => {
   const values = {};
-  if (!equipmentFields.some((field) => Object.hasOwn(body, field)) && existing.id) {
+  if (!equipmentFields.some((field) => Object.hasOwn(body, field)) && !hasImageUpload && existing.id) {
     throw badRequest('Provide at least one equipment field to update.');
   }
 
@@ -50,11 +50,6 @@ const validateEquipment = (body, existing = {}) => {
   } else if (existing.description === undefined) {
     values.description = '';
   }
-  if (Object.hasOwn(body, 'imageUrl')) {
-    values.imageUrl = validateImageUrl(body.imageUrl);
-  } else if (existing.imageUrl === undefined) {
-    values.imageUrl = '';
-  }
   if (Object.hasOwn(body, 'rentalRateType')) {
     if (!['hourly', 'daily'].includes(body.rentalRateType)) {
       throw badRequest('rentalRateType must be hourly or daily.');
@@ -69,14 +64,22 @@ const validateEquipment = (body, existing = {}) => {
     throw badRequest('rentalPrice is required.');
   }
   if (Object.hasOwn(body, 'availableDates')) {
-    values.availableDates = requireAvailableDates(body.availableDates);
+    let availableDates = body.availableDates;
+    if (typeof availableDates === 'string') {
+      try {
+        availableDates = JSON.parse(availableDates);
+      } catch {
+        throw badRequest('availableDates must be a JSON array.');
+      }
+    }
+    values.availableDates = requireAvailableDates(availableDates);
   } else if (!existing.availableDates?.length) {
     throw badRequest('availableDates is required.');
   }
   return { ...existing, ...values };
 };
 
-const findEquipment = (id) => equipment.find((item) => item.id === id);
+const findEquipment = (id) => findRecord('equipment', (item) => item.id === id);
 const availableOnOrAfterToday = (item) => {
   const today = new Date().toISOString().slice(0, 10);
   return item.availableDates.some((date) => date >= today);
@@ -97,28 +100,38 @@ const publicEquipment = (item) => ({
   updatedAt: item.updatedAt
 });
 
-export const createEquipment = (req, res) => {
+export const createEquipment = async (req, res) => {
+  rejectImageUrl(req.body || {});
   const values = validateEquipment(req.body || {});
+  const image = await resolveListingImage(req, null, 'farmlink/equipment');
   const item = {
     id: randomUUID(),
     ownerId: req.user.id,
     ...values,
+    imageUrl: image.imageUrl,
+    imagePublicId: image.imagePublicId,
     createdAt: new Date().toISOString()
   };
-  equipment.push(item);
+  let created;
+  try {
+    created = await insertRecord('equipment', item);
+  } catch (error) {
+    await cleanupListingImage(image.imagePublicId);
+    throw error;
+  }
   return res.status(201).json({
     success: true,
     message: 'Equipment listing created successfully.',
-    data: { equipment: publicEquipment(item) }
+    data: { equipment: publicEquipment(created) }
   });
 };
 
-export const listEquipment = (req, res) => {
+export const listEquipment = async (req, res) => {
   const search = String(req.query.search || '').toLowerCase();
   const category = String(req.query.category || '').toLowerCase();
   const location = String(req.query.location || '').toLowerCase();
   const rentalRateType = String(req.query.rentalRateType || '').toLowerCase();
-  const listings = equipment.filter((item) =>
+  const listings = await filterRecords('equipment', (item) =>
     availableOnOrAfterToday(item) &&
     item.equipmentName.toLowerCase().includes(search) &&
     item.category.toLowerCase().includes(category) &&
@@ -132,8 +145,8 @@ export const listEquipment = (req, res) => {
   });
 };
 
-export const getEquipment = (req, res) => {
-  const item = findEquipment(req.params.id);
+export const getEquipment = async (req, res) => {
+  const item = await findEquipment(req.params.id);
   if (!item) throw notFound('Equipment listing not found.');
   if (
     !availableOnOrAfterToday(item) &&
@@ -149,8 +162,8 @@ export const getEquipment = (req, res) => {
   });
 };
 
-export const getMyListings = (req, res) => {
-  const listings = equipment.filter((item) => item.ownerId === req.user.id);
+export const getMyListings = async (req, res) => {
+  const listings = await filterRecords('equipment', (item) => item.ownerId === req.user.id);
   return res.json({
     success: true,
     message: 'Your equipment listings retrieved successfully.',
@@ -158,36 +171,50 @@ export const getMyListings = (req, res) => {
   });
 };
 
-export const updateEquipment = (req, res) => {
-  const item = findEquipment(req.params.id);
+export const updateEquipment = async (req, res) => {
+  rejectImageUrl(req.body || {});
+  const item = await findEquipment(req.params.id);
   if (!item) throw notFound('Equipment listing not found.');
   if (item.ownerId !== req.user.id) throw forbidden();
-  const values = validateEquipment(req.body || {}, item);
-  const dateChangesConflict = bookings.some((booking) => {
-    if (
-      booking.serviceType !== 'EQUIPMENT' ||
-      booking.serviceId !== item.id ||
-      !['Pending', 'Accepted'].includes(booking.status)
-    ) return false;
+  const values = validateEquipment(req.body || {}, item, Boolean(req.file));
+  const activeEquipmentBookings = await filterRecords('bookings', (booking) =>
+    booking.serviceType === 'EQUIPMENT' &&
+    booking.serviceId === item.id &&
+    ['Pending', 'Accepted'].includes(booking.status)
+  );
+  const dateChangesConflict = activeEquipmentBookings.some((booking) => {
     return getDatesForBooking(booking, item.rentalRateType)
       .some((date) => !values.availableDates.includes(date));
   });
   if (dateChangesConflict) {
     throw new AppError(409, 'Availability cannot exclude a date with a pending or accepted rental.');
   }
-  Object.assign(item, values, { updatedAt: new Date().toISOString() });
+  const image = await resolveListingImage(req, item, 'farmlink/equipment');
+  let updated;
+  try {
+    updated = await updateRecord('equipment', item.id, {
+      ...values,
+      imageUrl: image.imageUrl,
+      imagePublicId: image.imagePublicId,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    if (req.file) await cleanupListingImage(image.imagePublicId);
+    throw error;
+  }
+  await cleanupListingImage(image.previousImagePublicId);
   return res.json({
     success: true,
     message: 'Equipment listing updated successfully.',
-    data: { equipment: publicEquipment(item) }
+    data: { equipment: publicEquipment(updated) }
   });
 };
 
-export const deleteEquipment = (req, res) => {
-  const item = findEquipment(req.params.id);
+export const deleteEquipment = async (req, res) => {
+  const item = await findEquipment(req.params.id);
   if (!item) throw notFound('Equipment listing not found.');
   if (item.ownerId !== req.user.id) throw forbidden();
-  const hasActiveBookings = bookings.some((booking) =>
+  const hasActiveBookings = await findRecord('bookings', (booking) =>
     booking.serviceType === 'EQUIPMENT' &&
     booking.serviceId === item.id &&
     ['Pending', 'Accepted'].includes(booking.status)
@@ -195,26 +222,25 @@ export const deleteEquipment = (req, res) => {
   if (hasActiveBookings) {
     throw new AppError(409, 'Resolve pending or accepted rentals before deleting this listing.');
   }
-  equipment.splice(equipment.indexOf(item), 1);
+  await removeRecord('equipment', item.id);
+  await cleanupListingImage(item.imagePublicId);
   return res.status(204).send();
 };
 
-export const getMyBookings = (req, res) => {
-  const myBookings = bookings
-    .filter((booking) =>
+export const getMyBookings = async (req, res) => {
+  const myBookings = (await filterRecords('bookings', (booking) =>
       booking.serviceType === 'EQUIPMENT' && booking.providerId === req.user.id
-    )
+    ))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-    .map((booking) => {
-      const item = findEquipment(booking.serviceId);
-      return {
-        ...booking,
-        equipmentName: item?.equipmentName || 'Equipment listing removed'
-      };
-    });
+  const equipmentListings = await listRecords('equipment');
+  const equipmentById = new Map(equipmentListings.map((item) => [item.id, item]));
+  const bookingsWithEquipmentName = myBookings.map((booking) => ({
+    ...booking,
+    equipmentName: equipmentById.get(booking.serviceId)?.equipmentName || 'Equipment listing removed'
+  }));
   return res.json({
     success: true,
     message: 'Your equipment bookings retrieved successfully.',
-    data: { count: myBookings.length, bookings: myBookings }
+    data: { count: bookingsWithEquipmentName.length, bookings: bookingsWithEquipmentName }
   });
 };

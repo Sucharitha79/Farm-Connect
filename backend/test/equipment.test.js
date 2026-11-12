@@ -4,7 +4,10 @@ import { after, before, test } from 'node:test';
 import jwt from 'jsonwebtoken';
 
 process.env.JWT_SECRET = 'test-secret-that-is-long-enough-for-equipment-tests';
+process.env.NODE_ENV = 'test';
 
+const { enableInMemoryRepositoryForTests } = await import('../data/repository.js');
+enableInMemoryRepositoryForTests();
 const [{ default: app }, { bookings, equipment, users }] = await Promise.all([
   import('../app.js'),
   import('../data/store.js')
@@ -14,9 +17,11 @@ const { config } = await import('../config/env.js');
 const ownerId = randomUUID();
 const farmerId = randomUUID();
 const workerId = randomUUID();
+const buyerId = randomUUID();
 const ownerToken = jwt.sign({ sub: ownerId, role: 'equipment_owner' }, config.jwtSecret);
 const farmerToken = jwt.sign({ sub: farmerId, role: 'farmer' }, config.jwtSecret);
 const workerToken = jwt.sign({ sub: workerId, role: 'worker' }, config.jwtSecret);
+const buyerToken = jwt.sign({ sub: buyerId, role: 'buyer' }, config.jwtSecret);
 
 let server;
 let baseUrl;
@@ -39,7 +44,8 @@ before(async () => {
   users.push(
     { id: ownerId, role: 'equipment_owner', isVerified: true, isBlocked: false },
     { id: farmerId, role: 'farmer', isVerified: true, isBlocked: false },
-    { id: workerId, role: 'worker', isVerified: true, isBlocked: false }
+    { id: workerId, role: 'worker', isVerified: true, isBlocked: false },
+    { id: buyerId, role: 'buyer', isVerified: true, isBlocked: false }
   );
   server = app.listen(0);
   await new Promise((resolve) => server.once('listening', resolve));
@@ -54,6 +60,7 @@ after(async () => {
 test('equipment listing permissions, availability, and rental history', async () => {
   assert.equal((await callApi('/api/equipment')).status, 401);
   assert.equal((await callApi('/api/equipment', { token: workerToken })).status, 403);
+  assert.equal((await callApi('/api/equipment', { token: buyerToken })).status, 200);
 
   const create = await callApi('/api/equipment', {
     method: 'POST',
@@ -62,7 +69,6 @@ test('equipment listing permissions, availability, and rental history', async ()
       equipmentName: 'Farm Tractor',
       category: 'Tractor',
       description: '55 HP tractor with operator option.',
-      imageUrl: 'https://example.test/tractor.jpg',
       rentalRateType: 'daily',
       rentalPrice: 12000,
       location: 'Nashik',
@@ -73,7 +79,7 @@ test('equipment listing permissions, availability, and rental history', async ()
   const listing = create.data.data.equipment;
   assert.equal(listing.ownerId, ownerId);
   assert.equal((await callApi('/api/equipment/my-listings', { token: ownerToken })).data.data.count, 1);
-  assert.equal((await callApi('/api/equipment/my-listings', { token: farmerToken })).status, 403);
+  assert.equal((await callApi('/api/equipment/my-listings', { token: farmerToken })).data.data.count, 0);
 
   const directory = await callApi('/api/equipment?category=tractor&location=nash&search=farm', {
     token: farmerToken
@@ -160,7 +166,7 @@ test('equipment listing permissions, availability, and rental history', async ()
   const history = await callApi('/api/equipment/my-bookings', { token: ownerToken });
   assert.equal(history.data.data.count, 2);
   assert.equal(history.data.data.bookings.some((booking) => booking.status === 'Completed'), true);
-  assert.equal((await callApi('/api/equipment/my-bookings', { token: farmerToken })).status, 403);
+  assert.equal((await callApi('/api/equipment/my-bookings', { token: farmerToken })).data.data.count, 0);
 
   const blockedDelete = await callApi(`/api/equipment/${listing.id}`, {
     method: 'DELETE',
@@ -178,4 +184,60 @@ test('equipment listing permissions, availability, and rental history', async ()
   assert.equal((await callApi('/api/equipment/my-bookings', { token: ownerToken }))
     .data.data.bookings.find((booking) => booking.id === completedBookingId).equipmentName,
   'Equipment listing removed');
+
+  const farmerListingResponse = await callApi('/api/equipment', {
+    method: 'POST',
+    token: farmerToken,
+    body: {
+      equipmentName: 'Farmer-owned Seeder',
+      category: 'Seeder',
+      rentalRateType: 'daily',
+      rentalPrice: 1500,
+      location: 'Nashik',
+      availableDates: [availableDate]
+    }
+  });
+  assert.equal(farmerListingResponse.status, 201);
+  const farmerListing = farmerListingResponse.data.data.equipment;
+  assert.equal(farmerListing.ownerId, farmerId);
+  assert.equal((await callApi('/api/equipment/my-listings', { token: farmerToken })).data.data.count, 1);
+  assert.equal((await callApi(`/api/equipment/${farmerListing.id}`, { token: buyerToken })).status, 200);
+
+  const ownRental = await callApi('/api/bookings', {
+    method: 'POST',
+    token: farmerToken,
+    body: {
+      serviceType: 'EQUIPMENT',
+      serviceId: farmerListing.id,
+      bookingDate: availableDate,
+      duration: 1,
+      location: 'Nashik'
+    }
+  });
+  assert.equal(ownRental.status, 400);
+  assert.match(ownRental.data.message, /own equipment listing/i);
+
+  const providerBookingId = randomUUID();
+  bookings.push({
+    id: providerBookingId,
+    farmerId: ownerId,
+    providerId: farmerId,
+    serviceType: 'EQUIPMENT',
+    serviceId: farmerListing.id,
+    bookingDate: availableDate,
+    bookingEndDate: availableDate,
+    duration: 1,
+    rateType: 'daily',
+    unitPrice: 1500,
+    location: 'Nashik',
+    totalPrice: 1500,
+    status: 'Pending',
+    createdAt: new Date().toISOString()
+  });
+  const acceptedByFarmer = await callApi(`/api/bookings/${providerBookingId}/accept`, {
+    method: 'PUT',
+    token: farmerToken
+  });
+  assert.equal(acceptedByFarmer.status, 200);
+  assert.equal(acceptedByFarmer.data.data.booking.status, 'Accepted');
 });

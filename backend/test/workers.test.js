@@ -4,7 +4,10 @@ import { after, before, test } from 'node:test';
 import jwt from 'jsonwebtoken';
 
 process.env.JWT_SECRET = 'test-secret-that-is-long-enough-for-worker-tests';
+process.env.NODE_ENV = 'test';
 
+const { enableInMemoryRepositoryForTests } = await import('../data/repository.js');
+enableInMemoryRepositoryForTests();
 const [{ default: app }, { bookings, users }] = await Promise.all([
   import('../app.js'),
   import('../data/store.js')
@@ -80,12 +83,16 @@ test('worker profiles, directory permissions, and farmer job requests', async ()
   });
   assert.equal(duplicate.status, 409);
 
-  const directory = await callApi('/api/workers?location=nash&skill=plant', {
+  const directory = await callApi('/api/workers?location=nash&skill=plant&wageType=daily&minWage=700&maxWage=850', {
     token: farmerToken
   });
   assert.equal(directory.status, 200);
   assert.equal(directory.data.data.count, 1);
   assert.equal(directory.data.data.workers[0].id, workerId);
+  assert.equal(directory.data.data.workers[0].isAvailable, true);
+  assert.equal((await callApi('/api/workers?minWage=900&maxWage=800', {
+    token: farmerToken
+  })).status, 400);
   assert.equal((await callApi('/api/workers', { token: buyerToken })).status, 403);
   assert.equal((await callApi(`/api/workers/${workerId}`, { token: farmerToken })).status, 200);
   assert.equal((await callApi('/api/workers/my-profile', { token: workerToken })).status, 200);
@@ -105,6 +112,38 @@ test('worker profiles, directory permissions, and farmer job requests', async ()
   assert.equal(update.status, 200);
   assert.equal(update.data.data.worker.wageAmount, 900);
   assert.equal(update.data.data.worker.wageType, 'hourly');
+
+  const unavailableUpdate = await callApi(`/api/workers/${workerId}`, {
+    method: 'PUT',
+    token: workerToken,
+    body: { isAvailable: false }
+  });
+  assert.equal(unavailableUpdate.status, 200);
+  assert.equal(unavailableUpdate.data.data.worker.isAvailable, false);
+  assert.equal((await callApi('/api/workers', { token: farmerToken })).data.data.count, 0);
+
+  const unavailableBooking = await callApi('/api/bookings', {
+    method: 'POST',
+    token: farmerToken,
+    body: {
+      serviceType: 'WORKER',
+      serviceId: workerId,
+      workType: 'Harvesting',
+      description: 'Collect the ripe crop.',
+      bookingDate: availableDate,
+      duration: 1,
+      location: 'Nashik'
+    }
+  });
+  assert.equal(unavailableBooking.status, 409);
+  assert.match(unavailableBooking.data.message, /unavailable/i);
+
+  const availableUpdate = await callApi(`/api/workers/${workerId}`, {
+    method: 'PUT',
+    token: workerToken,
+    body: { isAvailable: true }
+  });
+  assert.equal(availableUpdate.data.data.worker.isAvailable, true);
 
   const pendingBookingId = randomUUID();
   const unavailableBookingId = randomUUID();
@@ -137,12 +176,12 @@ test('worker profiles, directory permissions, and farmer job requests', async ()
     }
   );
 
-  const unavailableUpdate = await callApi(`/api/workers/${workerId}`, {
+  const unavailableDatesUpdate = await callApi(`/api/workers/${workerId}`, {
     method: 'PUT',
     token: workerToken,
     body: { availableDates: [availableDate] }
   });
-  assert.equal(unavailableUpdate.status, 409);
+  assert.equal(unavailableDatesUpdate.status, 409);
 
   const requests = await callApi('/api/workers/jobs', { token: workerToken });
   assert.equal(requests.data.data.count, 2);

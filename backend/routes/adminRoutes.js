@@ -2,6 +2,8 @@ import { Router } from 'express';
 import {
   deleteProduce,
   getAllBids,
+  getAllBookings,
+  getAllEquipment,
   getAllOrders,
   getAllProduce,
   getDashboard,
@@ -20,5 +22,7 @@ router.get('/produce', asyncHandler(getAllProduce));
 router.delete('/produce/:id', asyncHandler(deleteProduce));
 router.get('/bids', asyncHandler(getAllBids));
 router.get('/orders', asyncHandler(getAllOrders));
+router.get('/equipment', asyncHandler(getAllEquipment));
+router.get('/bookings', asyncHandler(getAllBookings));
 
 export default router;

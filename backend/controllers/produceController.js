@@ -1,6 +1,18 @@
 import { randomUUID } from 'node:crypto';
-import { bids, orders, produceListings } from '../data/store.js';
+import {
+  filterRecords,
+  findRecord,
+  insertRecord,
+  removeRecord,
+  removeRecords,
+  updateRecord
+} from '../data/repository.js';
 import { AppError, badRequest, forbidden, notFound } from '../utils/errors.js';
+import {
+  cleanupListingImage,
+  rejectImageUrl,
+  resolveListingImage
+} from '../utils/listingImage.js';
 import {
   optionalString,
   requirePositiveNumber,
@@ -8,7 +20,7 @@ import {
 } from '../utils/validation.js';
 
 const requiredTextFields = ['produceName', 'category', 'unit', 'location'];
-const optionalTextFields = ['description', 'imageUrl'];
+const optionalTextFields = ['description'];
 
 const validateProduce = (body, existing = {}) => {
   const result = {};
@@ -19,7 +31,8 @@ const validateProduce = (body, existing = {}) => {
   }
   for (const field of optionalTextFields) {
     const value = optionalString(body[field], field, {
-      max: field === 'description' ? 2000 : 1000
+      max: 2000,
+      min: 0
     });
     if (value !== undefined) result[field] = value;
     else if (!existing[field]) result[field] = '';
@@ -38,71 +51,97 @@ const validateProduce = (body, existing = {}) => {
   return result;
 };
 
-export const listProduce = (req, res) => {
+export const listProduce = async (req, res) => {
   const search = typeof req.query.search === 'string' ? req.query.search.toLowerCase() : '';
   const category = typeof req.query.category === 'string' ? req.query.category.toLowerCase() : '';
   const location = typeof req.query.location === 'string' ? req.query.location.toLowerCase() : '';
-  const items = produceListings.filter((item) =>
+  const items = (await filterRecords('produceListings', (item) =>
     item.status === 'available' &&
     item.produceName.toLowerCase().includes(search) &&
     item.category.toLowerCase().includes(category) &&
     item.location.toLowerCase().includes(location)
-  );
+  ));
   return res.json({ count: items.length, produce: items });
 };
 
-export const listMyProduce = (req, res) =>
-  res.json({ produce: produceListings.filter((item) => item.farmerId === req.user.id) });
+export const listMyProduce = async (req, res) =>
+  res.json({ produce: await filterRecords('produceListings', (item) => item.farmerId === req.user.id) });
 
-export const getProduce = (req, res) => {
-  const item = produceListings.find((entry) => entry.id === req.params.id);
+export const getProduce = async (req, res) => {
+  const item = await findRecord('produceListings', (entry) => entry.id === req.params.id);
   if (!item || (item.status !== 'available' && req.user?.role !== 'admin' && req.user?.id !== item.farmerId)) {
     throw notFound('Produce listing not found.');
   }
   return res.json({ produce: item });
 };
 
-export const createProduce = (req, res) => {
-  const values = validateProduce(req.body);
+export const createProduce = async (req, res) => {
+  const body = req.body || {};
+  rejectImageUrl(body);
+  const values = validateProduce(body);
+  const image = await resolveListingImage(req, null, 'farmlink/produce');
   const item = {
     id: randomUUID(),
     farmerId: req.user.id,
     ...values,
+    imageUrl: image.imageUrl,
+    imagePublicId: image.imagePublicId,
     status: 'available',
     createdAt: new Date().toISOString()
   };
-  produceListings.push(item);
-  return res.status(201).json({ produce: item });
+  let created;
+  try {
+    created = await insertRecord('produceListings', item);
+  } catch (error) {
+    await cleanupListingImage(image.imagePublicId);
+    throw error;
+  }
+  return res.status(201).json({ produce: created });
 };
 
-export const updateProduce = (req, res) => {
-  const item = produceListings.find((entry) => entry.id === req.params.id);
+export const updateProduce = async (req, res) => {
+  const body = req.body || {};
+  rejectImageUrl(body);
+  const item = await findRecord('produceListings', (entry) => entry.id === req.params.id);
   if (!item) throw notFound('Produce listing not found.');
   if (item.farmerId !== req.user.id) throw forbidden();
   if (item.status !== 'available') throw new AppError(409, 'Only available listings can be updated.');
 
-  const values = validateProduce(req.body, item);
+  const values = validateProduce(body, item);
   if (
     values.quantity !== undefined &&
-    bids.some((bid) => bid.produceId === item.id && bid.status === 'pending' && bid.quantity > values.quantity)
+    await findRecord('bids', (bid) =>
+      bid.produceId === item.id && bid.status === 'pending' && bid.quantity > values.quantity
+    )
   ) {
     throw new AppError(409, 'Quantity cannot be lower than an existing pending bid quantity.');
   }
-  Object.assign(item, values, { updatedAt: new Date().toISOString() });
-  return res.json({ produce: item });
+  const image = await resolveListingImage(req, item, 'farmlink/produce');
+  let updated;
+  try {
+    updated = await updateRecord('produceListings', item.id, {
+      ...values,
+      imageUrl: image.imageUrl,
+      imagePublicId: image.imagePublicId,
+      updatedAt: new Date().toISOString()
+    });
+  } catch (error) {
+    if (req.file) await cleanupListingImage(image.imagePublicId);
+    throw error;
+  }
+  await cleanupListingImage(image.previousImagePublicId);
+  return res.json({ produce: updated });
 };
 
-export const deleteProduce = (req, res) => {
-  const index = produceListings.findIndex((entry) => entry.id === req.params.id);
-  if (index < 0) throw notFound('Produce listing not found.');
-  const item = produceListings[index];
+export const deleteProduce = async (req, res) => {
+  const item = await findRecord('produceListings', (entry) => entry.id === req.params.id);
+  if (!item) throw notFound('Produce listing not found.');
   if (item.farmerId !== req.user.id) throw forbidden();
-  if (orders.some((order) => order.produceId === item.id)) {
+  if (await findRecord('orders', (order) => order.produceId === item.id)) {
     throw new AppError(409, 'A listing with an order cannot be deleted.');
   }
-  produceListings.splice(index, 1);
-  for (let i = bids.length - 1; i >= 0; i -= 1) {
-    if (bids[i].produceId === item.id) bids.splice(i, 1);
-  }
+  await removeRecord('produceListings', item.id);
+  await removeRecords('bids', (bid) => bid.produceId === item.id);
+  await cleanupListingImage(item.imagePublicId);
   return res.status(204).send();
 };

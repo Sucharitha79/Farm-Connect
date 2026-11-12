@@ -1,6 +1,6 @@
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
-import { users } from './store.js';
+import { findRecord, insertRecord } from './repository.js';
 import { isValidEmail } from '../utils/validation.js';
 
 export const seedAdmin = async () => {
@@ -13,16 +13,18 @@ export const seedAdmin = async () => {
   if (!isValidEmail(email) || password.length < 8 || password.length > 72) {
     throw new Error('ADMIN_EMAIL must be valid and ADMIN_PASSWORD must be 8-72 characters.');
   }
-  if (users.some((user) => user.email === email)) return;
-  users.push({
+  if (await findRecord('users', (user) => user.email === email)) return;
+  const user = {
     id: randomUUID(),
     name: 'FarmLink Admin',
     email,
+    mobileNumber: '',
     passwordHash: await bcrypt.hash(password, 12),
     role: 'admin',
     isVerified: true,
     location: '',
     isBlocked: false,
     createdAt: new Date().toISOString()
-  });
+  };
+  await insertRecord('users', user);
 };

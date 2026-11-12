@@ -1,27 +1,36 @@
 import { randomUUID } from 'node:crypto';
-import { bookings, equipment, workers } from '../data/store.js';
+import {
+  filterRecords,
+  findRecord,
+  insertRecord,
+  listRecords,
+  updateRecord
+} from '../data/repository.js';
 import { AppError, badRequest, forbidden, notFound } from '../utils/errors.js';
 import {
   requirePositiveNumber,
   requireString
 } from '../utils/validation.js';
-import { bookingDatesOverlap, getBookingDates } from '../utils/bookingDates.js';
+import { getBookingDates } from '../utils/bookingDates.js';
 
 const serviceTypes = ['WORKER', 'EQUIPMENT'];
 
-const getProviderDetails = (serviceType, serviceId) => {
+const getProviderDetails = async (serviceType, serviceId) => {
   if (serviceType === 'WORKER') {
-    const worker = workers.find((entry) => entry.id === serviceId || entry.userId === serviceId);
+    const worker = await findRecord('workers', (entry) =>
+      entry.id === serviceId || entry.userId === serviceId
+    );
     if (!worker) throw notFound('Worker profile not found.');
     return {
       providerId: worker.userId,
       serviceId: worker.id,
       rateType: worker.wageType,
       rate: worker.wageAmount,
+      isAvailable: worker.isAvailable !== false,
       availableDates: worker.availableDates
     };
   }
-  const item = equipment.find((entry) => entry.id === serviceId);
+  const item = await findRecord('equipment', (entry) => entry.id === serviceId);
   if (!item) throw notFound('Equipment listing not found.');
   return {
     providerId: item.ownerId,
@@ -32,25 +41,34 @@ const getProviderDetails = (serviceType, serviceId) => {
   };
 };
 
-const hasAcceptedConflict = (providerId, serviceType, serviceId, requestedDates) => {
+const hasBookingConflict = async (
+  providerId,
+  serviceType,
+  serviceId,
+  requestedDates,
+  statuses = ['Accepted'],
+  excludeBookingId = ''
+) => {
   const requested = {
     bookingDate: requestedDates[0],
     bookingEndDate: requestedDates.at(-1),
     duration: requestedDates.length,
     rateType: 'daily'
   };
-  return bookings.some((booking) =>
+  return Boolean(await findRecord('bookings', (booking) =>
+    booking.id !== excludeBookingId &&
     booking.providerId === providerId &&
     booking.serviceType === serviceType &&
     booking.serviceId === serviceId &&
-    booking.status === 'Accepted' &&
-    bookingDatesOverlap(requested, booking)
-  );
+    statuses.includes(booking.status) &&
+    booking.bookingDate <= requested.bookingEndDate &&
+    (booking.bookingEndDate || booking.bookingDate) >= requested.bookingDate
+  ));
 };
 
-const getOwnBookings = (user) => {
-  if (user.role === 'admin') return [...bookings];
-  return bookings.filter((booking) =>
+const getOwnBookings = async (user) => {
+  if (user.role === 'admin') return listRecords('bookings');
+  return filterRecords('bookings', (booking) =>
     booking.farmerId === user.id || booking.providerId === user.id
   );
 };
@@ -58,21 +76,27 @@ const getOwnBookings = (user) => {
 const canManageBooking = (booking, user) =>
   booking.serviceType === 'WORKER'
     ? booking.providerId === user.id && user.role === 'worker'
-    : booking.providerId === user.id && user.role === 'equipment_owner';
+    : booking.providerId === user.id && ['equipment_owner', 'farmer'].includes(user.role);
 
-const findBooking = (id) => {
-  const booking = bookings.find((entry) => entry.id === id);
+const findBooking = async (id) => {
+  const booking = await findRecord('bookings', (entry) => entry.id === id);
   if (!booking) throw notFound('Booking not found.');
   return booking;
 };
 
-export const createBooking = (req, res) => {
+export const createBooking = async (req, res) => {
   const body = req.body || {};
   if (!serviceTypes.includes(body.serviceType)) {
     throw badRequest('serviceType must be WORKER or EQUIPMENT.');
   }
   const serviceId = requireString(body.serviceId, 'serviceId', { max: 100 });
-  const rateTypeDetails = getProviderDetails(body.serviceType, serviceId);
+  const rateTypeDetails = await getProviderDetails(body.serviceType, serviceId);
+  if (body.serviceType === 'EQUIPMENT' && rateTypeDetails.providerId === req.user.id) {
+    throw badRequest('You cannot request a rental for your own equipment listing.');
+  }
+  if (body.serviceType === 'WORKER' && !rateTypeDetails.isAvailable) {
+    throw new AppError(409, 'This worker is currently unavailable.');
+  }
   const duration = requirePositiveNumber(body.duration, 'duration');
   if (!Number.isInteger(duration)) {
     throw badRequest('duration must be a whole number.');
@@ -81,15 +105,24 @@ export const createBooking = (req, res) => {
   if (requestedDates.some((date) => !rateTypeDetails.availableDates.includes(date))) {
     throw new AppError(409, 'The provider is not available for every requested date.');
   }
-  if (hasAcceptedConflict(
+  const conflictingStatuses = body.serviceType === 'WORKER'
+    ? ['Pending', 'Accepted']
+    : ['Accepted'];
+  if (await hasBookingConflict(
     rateTypeDetails.providerId,
     body.serviceType,
     rateTypeDetails.serviceId,
-    requestedDates
+    requestedDates,
+    conflictingStatuses
   )) {
-    throw new AppError(409, 'This provider already has an accepted booking for the requested date.');
+    throw new AppError(
+      409,
+      body.serviceType === 'WORKER'
+        ? 'This worker already has a pending or confirmed booking on an overlapping date.'
+        : 'This provider already has an accepted booking for the requested date.'
+    );
   }
-  if (bookings.some((booking) =>
+  if (await findRecord('bookings', (booking) =>
     booking.farmerId === req.user.id &&
     booking.serviceType === body.serviceType &&
     booking.serviceId === rateTypeDetails.serviceId &&
@@ -101,6 +134,14 @@ export const createBooking = (req, res) => {
   }
 
   const location = requireString(body.location, 'location', { max: 200 });
+  const workType = body.serviceType === 'WORKER'
+    ? body.workType === undefined
+      ? 'General farm work'
+      : requireString(body.workType, 'workType', { max: 100 })
+    : '';
+  const description = body.serviceType === 'WORKER' && body.description !== undefined
+    ? requireString(body.description, 'description', { max: 2000, min: 0 })
+    : '';
   const totalPrice = rateTypeDetails.rate * duration;
   if (!Number.isFinite(totalPrice) || totalPrice <= 0 || totalPrice > Number.MAX_SAFE_INTEGER) {
     throw badRequest('The calculated booking price is outside the supported range.');
@@ -112,6 +153,8 @@ export const createBooking = (req, res) => {
     providerId: rateTypeDetails.providerId,
     serviceType: body.serviceType,
     serviceId: rateTypeDetails.serviceId,
+    workType,
+    description,
     bookingDate: requestedDates[0],
     bookingEndDate: requestedDates.at(-1),
     duration,
@@ -122,7 +165,7 @@ export const createBooking = (req, res) => {
     status: 'Pending',
     createdAt: new Date().toISOString()
   };
-  bookings.push(booking);
+  await insertRecord('bookings', booking);
   return res.status(201).json({
     success: true,
     message: 'Booking request created successfully.',
@@ -130,8 +173,8 @@ export const createBooking = (req, res) => {
   });
 };
 
-export const listBookings = (req, res) => {
-  let items = getOwnBookings(req.user);
+export const listBookings = async (req, res) => {
+  let items = await getOwnBookings(req.user);
   if (req.query.status) {
     items = items.filter((booking) => booking.status === req.query.status);
   }
@@ -146,8 +189,8 @@ export const listBookings = (req, res) => {
   });
 };
 
-export const getMyBookings = (req, res) => {
-  const items = getOwnBookings(req.user)
+export const getMyBookings = async (req, res) => {
+  const items = (await getOwnBookings(req.user))
     .sort((first, second) => second.createdAt.localeCompare(first.createdAt));
   return res.json({
     success: true,
@@ -156,8 +199,8 @@ export const getMyBookings = (req, res) => {
   });
 };
 
-export const getBooking = (req, res) => {
-  const booking = findBooking(req.params.id);
+export const getBooking = async (req, res) => {
+  const booking = await findBooking(req.params.id);
   if (
     req.user.role !== 'admin' &&
     booking.farmerId !== req.user.id &&
@@ -172,8 +215,8 @@ export const getBooking = (req, res) => {
   });
 };
 
-const updateBookingStatus = (req, res, nextStatus) => {
-  const booking = findBooking(req.params.id);
+const updateBookingStatus = async (req, res, nextStatus) => {
+  const booking = await findBooking(req.params.id);
   const isFarmer = booking.farmerId === req.user.id && req.user.role === 'farmer';
   const isProvider = canManageBooking(booking, req.user);
   if (!isFarmer && !isProvider && req.user.role !== 'admin') throw forbidden();
@@ -201,7 +244,7 @@ const updateBookingStatus = (req, res, nextStatus) => {
       throw new AppError(409, 'Only pending bookings can be accepted or rejected.');
     }
     if (nextStatus === 'Accepted') {
-      const details = getProviderDetails(booking.serviceType, booking.serviceId);
+      const details = await getProviderDetails(booking.serviceType, booking.serviceId);
       const requestedDates = getBookingDates(
         booking.bookingDate,
         booking.duration,
@@ -210,27 +253,34 @@ const updateBookingStatus = (req, res, nextStatus) => {
       if (requestedDates.some((date) => !details.availableDates.includes(date))) {
         throw new AppError(409, 'The provider is no longer available for every requested date.');
       }
-      if (hasAcceptedConflict(
+      const conflictingStatuses = booking.serviceType === 'WORKER'
+        ? ['Pending', 'Accepted']
+        : ['Accepted'];
+      if (await hasBookingConflict(
         booking.providerId,
         booking.serviceType,
         booking.serviceId,
-        requestedDates
+        requestedDates,
+        conflictingStatuses,
+        booking.id
       )) {
-        throw new AppError(409, 'Another booking has already been accepted for the requested date.');
+        throw new AppError(409, 'Another booking overlaps the requested date.');
       }
     }
   }
 
-  booking.status = nextStatus;
-  booking.updatedAt = new Date().toISOString();
+  const updated = await updateRecord('bookings', booking.id, {
+    status: nextStatus,
+    updatedAt: new Date().toISOString()
+  });
   return res.json({
     success: true,
     message: `Booking ${nextStatus.toLowerCase()} successfully.`,
-    data: { booking }
+    data: { booking: updated }
   });
 };
 
-export const acceptBooking = (req, res) => updateBookingStatus(req, res, 'Accepted');
-export const rejectBooking = (req, res) => updateBookingStatus(req, res, 'Rejected');
-export const cancelBooking = (req, res) => updateBookingStatus(req, res, 'Cancelled');
-export const completeBooking = (req, res) => updateBookingStatus(req, res, 'Completed');
+export const acceptBooking = async (req, res) => updateBookingStatus(req, res, 'Accepted');
+export const rejectBooking = async (req, res) => updateBookingStatus(req, res, 'Rejected');
+export const cancelBooking = async (req, res) => updateBookingStatus(req, res, 'Cancelled');
+export const completeBooking = async (req, res) => updateBookingStatus(req, res, 'Completed');

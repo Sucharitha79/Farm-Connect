@@ -1,4 +1,4 @@
-import { orders } from '../data/store.js';
+import { filterRecords, findRecord, updateRecord } from '../data/repository.js';
 import { AppError, badRequest, forbidden, notFound } from '../utils/errors.js';
 
 const transitions = {
@@ -10,15 +10,15 @@ const transitions = {
   Cancelled: []
 };
 
-export const listMyOrders = (req, res) => {
-  const userOrders = orders.filter(
+export const listMyOrders = async (req, res) => {
+  const userOrders = await filterRecords('orders',
     (order) => order.buyerId === req.user.id || order.farmerId === req.user.id
   );
   return res.json({ orders: userOrders });
 };
 
-export const getOrder = (req, res) => {
-  const order = orders.find(
+export const getOrder = async (req, res) => {
+  const order = await findRecord('orders',
     (entry) => entry.id === req.params.id || entry.orderNumber === req.params.id
   );
   if (!order) throw notFound('Order not found.');
@@ -30,8 +30,8 @@ export const getOrder = (req, res) => {
   return res.json({ order });
 };
 
-export const updateOrderStatus = (req, res) => {
-  const order = orders.find((entry) => entry.id === req.params.id);
+export const updateOrderStatus = async (req, res) => {
+  const order = await findRecord('orders', (entry) => entry.id === req.params.id);
   if (!order) throw notFound('Order not found.');
   const nextStatus = req.body.status;
   if (!Object.hasOwn(transitions, nextStatus)) {
@@ -50,7 +50,9 @@ export const updateOrderStatus = (req, res) => {
   if (!transitions[order.status].includes(nextStatus)) {
     throw new AppError(409, `Order cannot transition from ${order.status} to ${nextStatus}.`);
   }
-  order.status = nextStatus;
-  order.updatedAt = new Date().toISOString();
-  return res.json({ order });
+  const updatedOrder = await updateRecord('orders', order.id, {
+    status: nextStatus,
+    updatedAt: new Date().toISOString()
+  });
+  return res.json({ order: updatedOrder });
 };
